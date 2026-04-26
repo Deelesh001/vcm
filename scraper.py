@@ -95,10 +95,7 @@ async def download_verra_csv():
         # Set up download handler and click Export/CSV button
         print("📥 Clicking CSV Export button...")
         async with page.expect_download(timeout=60000) as download_info:
-            csv_button = page.locator(
-                "button:has-text('CSV'), button:has-text('Export'), button:has-text('Download'), "
-                "a:has-text('CSV'), a:has-text('Export')"
-            ).first
+            csv_button = page.locator("button[title='Download CSV']")
             await csv_button.wait_for(state="visible", timeout=20000)
             await csv_button.click()
 
