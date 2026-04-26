@@ -1,15 +1,15 @@
 """
 Verra VCM Registry - CSV Downloader
-Uses Playwright to control a real browser, bypassing Cloudflare protection.
-Clicks Search, then Export CSV, and saves the file.
+Uses Playwright to load the page (getting Cloudflare cookies),
+then uses the browser's own fetch() to call the CSV API directly.
 """
 
 import asyncio
-import os
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 VERRA_URL = "https://registry.verra.org/app/search/VCS"
+CSV_URL = "https://registry.verra.org/uiapi/resource/resource/search?$skip=0&count=true&$format=csv&$exportFileName=allprojects.csv"
 OUTPUT_FILE = "verra_allprojects.csv"
 
 
@@ -33,17 +33,6 @@ async def download_verra_csv():
             locale="en-US",
         )
 
-        # Hide webdriver flag from Cloudflare
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
-
-        page = await context.new_page()
-
-        # Manual stealth — patches Cloudflare detection points
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -52,87 +41,90 @@ async def download_verra_csv():
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
             window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-            );
-            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                return getParameter(parameter);
-            };
         """)
+
+        page = await context.new_page()
 
         print(f"🌐 Navigating to {VERRA_URL}...")
         await page.goto(VERRA_URL, wait_until="networkidle", timeout=60000)
 
-        # Wait for Cloudflare challenge to pass if present
         print("⏳ Waiting for page to fully load...")
         await page.wait_for_timeout(4000)
 
-        # Check if we hit a Cloudflare block
         title = await page.title()
         print(f"   Page title: {title}")
         if "just a moment" in title.lower() or "cloudflare" in title.lower():
-            print("⚠️  Cloudflare challenge detected — waiting longer...")
-            await page.wait_for_timeout(8000)
+            print("⚠️  Cloudflare challenge — waiting longer...")
+            await page.wait_for_timeout(10000)
 
-        # Click Search button (no filters = all projects)
+        # Intercept the search POST to capture the request body
+        print("🔍 Intercepting search request body...")
+        search_body = None
+
+        async def handle_request(request):
+            nonlocal search_body
+            if "resource/search" in request.url and request.method == "POST" and "$format=csv" not in request.url:
+                search_body = request.post_data
+                print(f"   📦 Captured search body ({len(search_body or '')} bytes): {(search_body or '')[:200]}")
+
+        page.on("request", handle_request)
+
+        # Click Search
         print("🔍 Clicking Search...")
         search_button = page.locator("button:has-text('Search'), input[type='submit'][value*='Search'], [class*='search'] button").first
         await search_button.wait_for(state="visible", timeout=20000)
         await search_button.click()
 
-        # Wait for results to load
-        print("⏳ Waiting for search results...")
-        await page.wait_for_timeout(5000)
+        # Wait for results
+        print("⏳ Waiting for search results to load...")
+        await page.wait_for_timeout(8000)
         await page.wait_for_load_state("networkidle", timeout=30000)
 
-        # Debug: log ALL responses to find the CSV endpoint
-        print("📥 Clicking CSV Export button...")
-        csv_response = None
+        if not search_body:
+            print("⚠️  No search body captured — using empty body")
+            search_body = "{}"
 
-        async def handle_response(response):
-            nonlocal csv_response
-            print(f"  📡 Response: {response.status} {response.url[:100]}")
-            if "$format=csv" in response.url or "csv" in response.headers.get("content-type", "").lower() or "csv" in response.url.lower():
-                if response.status == 200:
-                    csv_response = await response.body()
-                    print(f"  ✅ Found CSV: {len(csv_response):,} bytes")
+        print(f"📥 Calling CSV API via browser fetch (with live cookies)...")
 
-        page.on("response", handle_response)
+        # Use browser's own fetch — automatically carries cf_clearance + all cookies
+        js_code = """
+            async (csvUrl, bodyStr) => {
+                const response = await fetch(csvUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Accept": "text/csv",
+                        "Referer": "https://registry.verra.org/app/search/VCS"
+                    },
+                    body: bodyStr
+                });
+                const status = response.status;
+                const contentType = response.headers.get("content-type") || "";
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error("HTTP " + status + ": " + text.substring(0, 200));
+                }
+                const text = await response.text();
+                return { status, contentType, data: text, size: text.length };
+            }
+        """
 
-        csv_button = page.locator("button[title='Download CSV']")
-        await csv_button.wait_for(state="visible", timeout=20000)
-        await csv_button.click()
-        print("  🖱️ Button clicked")
+        result = await page.evaluate(js_code, CSV_URL, search_body)
 
-        # Wait up to 60s for the CSV response
-        print("⏳ Waiting for CSV data...")
-        for i in range(60):
-            if csv_response is not None:
-                break
-            await page.wait_for_timeout(1000)
-            if i % 5 == 0:
-                print(f"  ... still waiting ({i}s)")
+        print(f"   Status: {result['status']}")
+        print(f"   Content-Type: {result['contentType']}")
+        print(f"   Size: {result['size']:,} chars")
 
-        if csv_response is None:
-            raise Exception("❌ CSV response never arrived — check the response URLs printed above")
+        if result['size'] < 100:
+            raise Exception(f"❌ Response too small: {result['data'][:300]}")
 
         # Save the file
-        with open(OUTPUT_FILE, "wb") as f:
-            f.write(csv_response)
-        file_size = Path(OUTPUT_FILE).stat().st_size
-        print(f"💾 Saved to: {OUTPUT_FILE} ({file_size:,} bytes)")
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(result['data'])
 
-        # Quick check on row count
-        with open(OUTPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        print(f"📊 Rows in CSV: {len(lines):,} (including header)")
+        lines = result['data'].split("\n")
+        print(f"📊 Rows: {len(lines):,} (including header)")
+        print(f"💾 Saved to: {OUTPUT_FILE}")
 
         await browser.close()
         print("✅ Done!")
