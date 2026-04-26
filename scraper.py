@@ -92,18 +92,35 @@ async def download_verra_csv():
         await page.wait_for_timeout(5000)
         await page.wait_for_load_state("networkidle", timeout=30000)
 
-        # Set up download handler and click Export/CSV button
+        # Intercept the CSV response directly from the network
         print("📥 Clicking CSV Export button...")
-        async with page.expect_download(timeout=60000) as download_info:
-            csv_button = page.locator("button[title='Download CSV']")
-            await csv_button.wait_for(state="visible", timeout=20000)
-            await csv_button.click()
+        csv_response = None
 
-        download = await download_info.value
-        print(f"✅ Download started: {download.suggested_filename}")
+        async def handle_response(response):
+            nonlocal csv_response
+            if "$format=csv" in response.url and response.status == 200:
+                csv_response = await response.body()
+                print(f"✅ Intercepted CSV response: {len(csv_response):,} bytes")
+
+        page.on("response", handle_response)
+
+        csv_button = page.locator("button[title='Download CSV']")
+        await csv_button.wait_for(state="visible", timeout=20000)
+        await csv_button.click()
+
+        # Wait for the network response to be captured
+        print("⏳ Waiting for CSV data...")
+        for _ in range(30):
+            if csv_response is not None:
+                break
+            await page.wait_for_timeout(1000)
+
+        if csv_response is None:
+            raise Exception("❌ CSV response never arrived — button click may not have triggered the request")
 
         # Save the file
-        await download.save_as(OUTPUT_FILE)
+        with open(OUTPUT_FILE, "wb") as f:
+            f.write(csv_response)
         file_size = Path(OUTPUT_FILE).stat().st_size
         print(f"💾 Saved to: {OUTPUT_FILE} ({file_size:,} bytes)")
 
